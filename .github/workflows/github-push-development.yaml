@@ -1,0 +1,152 @@
+---
+name: Build and push to ghcr.io
+
+on:
+  workflow_dispatch:
+  push:
+
+env:
+  PLATFORMS: |-
+    linux/amd64
+    linux/arm64
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate-matrix.outputs.matrix }}
+    steps:
+      - id: generate-matrix
+        shell: bash
+        run: |
+          echo -n "matrix=" >> $GITHUB_OUTPUT
+          # Output a JSON list containing all PLATFORMS
+          echo "${{ env.PLATFORMS }}" | \
+            jq -R -c '[{ platform: . }]' | \
+            jq -n '{ platforms: [ [inputs[0].platform] ] | add}.platforms' -c >> $GITHUB_OUTPUT
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      # Use matrix to speed up builds
+      matrix:
+        platform: ${{ fromJSON(needs.generate-matrix.outputs.matrix) }}
+
+    needs:
+      - generate-matrix
+
+    steps:
+      - uses: actions/checkout@v3
+
+      # Spec requires ref to be lowercase, but
+      # user/org/repo name may have mixed case
+      - name: Sanitize image ref
+        uses: ASzc/change-string-case-action@v6
+        id: ref
+        with:
+          string: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ steps.ref.outputs.lowercase }},push-by-digest=true,name-canonical=true,push=true
+          # Enable cache to speed up builds
+          # Scope is to ensure that images don't overwrite each other's cache
+          cache-from: type=gha,scope=${{ env.REGISTRY }}-${{ github.ref_name }}-${{ matrix.platform }}-executable
+          cache-to: type=gha,mode=max,scope=${{ env.REGISTRY }}-${{ github.ref_name }}-${{ matrix.platform }}-executable
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v3
+        with:
+          name: digests
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+
+  merge_and_publish:
+    runs-on: ubuntu-latest
+    needs:
+      - build
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v3
+        with:
+          name: digests
+          path: /tmp/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      # Spec requires ref to be lowercase, but
+      # user/org/repo name may have mixed case
+      - name: Sanitize image ref
+        uses: ASzc/change-string-case-action@v6
+        id: ref
+        with:
+          string: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          tags: |
+            # tag tags with :tag
+            type=ref,event=tag
+            # tag branches with :branch
+            type=ref,event=branch
+            # tag default branch with :latest
+            type=raw,value=latest,enable={{is_default_branch}}
+          flavor: |
+            # Do not tag tags with :latest
+            latest=false
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ steps.ref.outputs.lowercase }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ steps.ref.outputs.lowercase }}:${{ steps.meta.outputs.version }}
